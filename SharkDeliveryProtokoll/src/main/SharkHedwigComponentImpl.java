@@ -1,3 +1,6 @@
+import main.DeliveryContract;
+import main.DeliveryContractImpl;
+import main.DeliveryContractStorage;
 import net.sharksystem.SharkComponent;
 import net.sharksystem.SharkException;
 import net.sharksystem.asap.*;
@@ -7,20 +10,25 @@ import net.sharksystem.pki.SharkPKIComponent;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.io.ByteArrayOutputStream;
 import java.util.Set;
 
-public class SharkDeliveryProtocolComponentImpl implements SharkComponent, SharkDeliveryProtocolComponent, ASAPMessageReceivedListener {
-
+public class SharkHedwigComponentImpl implements SharkComponent, SharkHedwigComponent, ASAPMessageReceivedListener {
+    DeliveryContractStorage contractStorage;
     ASAPPeer asapPeer;
     SharkPKIComponent sharkPKIComponent;
     IdentificationSession identificationSession;
     SharkDeliveryProtocolRole role;
-    boolean readyTostartDeleveryProtocol = false;
+    CharSequence packageID;
+    CharSequence myID;
+    CharSequence transferee;
     DeliveryContract deliveryContract;
-    public SharkDeliveryProtocolComponentImpl(SharkPKIComponent sharkPKIComponent){
+    CharSequence caID = "ImCA";
+    PKIManager pkiManager;
+    public SharkHedwigComponentImpl(SharkPKIComponent sharkPKIComponent){
         this.sharkPKIComponent = sharkPKIComponent;
     }
 
@@ -28,20 +36,27 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
     public void onStart(ASAPPeer asapPeer) throws SharkException {
         this.asapPeer=asapPeer;
         this.asapPeer.addASAPMessageReceivedListener(
-                SharkDeliveryProtocolComponent.SHARK_DELIVERY_PROTOCOL_FORMAT,
+                SharkHedwigComponent.SHARK_HEDWIG_FORMAT,
                 this);
         try {
-            this.asapPeer.getASAPStorage(SHARK_DELIVERY_PROTOCOL_FORMAT).createChannel(SHARK_DELIVERY_URI_IDENTIFICATION_CODE);
+            this.asapPeer.getASAPStorage(SHARK_HEDWIG_FORMAT).createChannel(SHARK_HEDWIG_URI_IDENTIFICATION_CODE);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        try {
+            myID = this.asapPeer.getASAPStorage(SHARK_HEDWIG_FORMAT).getOwner();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        pkiManager = new PKIManagerImpl(caID, sharkPKIComponent);
+
     }
 
     @Override
     public void asapMessagesReceived(ASAPMessages asapMessages, String s, List<ASAPHop> list) throws IOException {
         CharSequence uri = asapMessages.getURI();
         switch (uri.toString()){
-            case SHARK_DELIVERY_URI_IDENTIFICATION_CODE:
+            case SHARK_HEDWIG_URI_IDENTIFICATION_CODE:
                 if(this.identificationSession == null){
                     identificationSession = new IdentificationSession();
                 }
@@ -57,9 +72,13 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
                 } catch (ASAPException e) {
                     throw new RuntimeException(e);
                 }
-                IdentificationMessageContent cont = identificationSession.answerIdentificationMessage((IdentificationMessageContent) Utils.byteArrayToObject(decryptedMessage.content) );
-                if(cont == null){
-                    return; //WHEN CONFIRMATION maessage, notify listener? TODO:
+                MessageContent cont = identificationSession.answerIdentificationMessage((IdentificationMessageContent) Utils.byteArrayToObject(decryptedMessage.content) );
+                if(cont == null){ //Identification done
+                    DeliveryContract contract = contractStorage.get(packageID);
+                    int transitorder = contract.getHistoryOfTransitContracts().size();
+                    TransitContract newTransitContract = TransitContract.createTransitContract(transitorder, packageID, myID, transferee, Utils.getMyLocation(), Utils.getLocaltime());
+                    contract.setCurrentTransitContract(newTransitContract);
+                    cont = contract;
                 }
                 try {
                     sendAndEncryptMessage(cont, decryptedMessage.sender);
@@ -67,7 +86,7 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
                     throw new RuntimeException(e);
                 }
                 break;
-            case SHARK_DELIVERY_URI_DELIVERYCONTRACT_CODE:
+            case SHARK_HEDWIG_URI_DELIVERY:
                 if(!identificationSession.bothPartnerIdentified()){
                     return; //TODO: Throw error???
                 }
@@ -84,25 +103,30 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
                 }
                 if(role == null){
                     role = SharkDeliveryProtocolRole.TRANSFEREE;
-                    DeliveryContract received = (DeliveryContract) Utils.byteArrayToObject(decrytedMsg.content);
+                    DeliveryContract received = (DeliveryContractImpl) Utils.byteArrayToObject(decrytedMsg.content);
                     TransitContract transit= received.getCurrentTransitContract();
-                    if(received.proveDeliveryContract()){
-                        transit.sign(sharkPKIComponent,SharkDeliveryProtocolRole.TRANSFEREE);
+                    try {
+                        if(received.deliveryContractIsOK(pkiManager)){
+                            transit.sign(sharkPKIComponent,SharkDeliveryProtocolRole.TRANSFEREE);
+                        }
+                    } catch (ASAPSecurityException e) {
+                        throw new RuntimeException(e);
                     }
                     try {
                         sendAndEncryptMessage(transit, transit.getTransferor());
-                        deliveryContract.addCurrentTransitContractTohistory();
+                        received.addCurrentTransitContractTohistory(transit);
+                        contractStorage.save(received);
 
-                        //TODO: save this contract
                     } catch (ASAPException e) {
                         throw new RuntimeException(e);
                     }
 
                 }else if(role == SharkDeliveryProtocolRole.TRANSFEROR){
+
                     TransitContract transitContract = (TransitContract) Utils.byteArrayToObject(decrytedMsg.content);
-                    if(transitContract.signedByBothPartner()){
-                        deliveryContract.addCurrentTransitContractTohistory();
-                        //TODO: save this deliveryContract
+                    if(transitContract.signedByBothPartner(pkiManager) && transitContract.isSameAs(deliveryContract.getCurrentTransitContract())){
+                        deliveryContract.addCurrentTransitContractTohistory(transitContract);
+                        contractStorage.save(deliveryContract);
                         //Paketübergabe findet statt
                     }else{
                         //hat nicht geklappt
@@ -115,26 +139,6 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
 
 
         }
-    }
-    public void createAndSendNewDeliveryContract(CharSequence transferee, CharSequence packageID) throws ASAPException, IOException {
-        DeliveryContract lastContract = getDeliveryContractByPackageID(CharSequence packageID);
-        DeliveryContract newContract = DeliveryContract.createAndSignDeliveryContractForTransit(lastContract.getMetadata(), transferee,sharkPKIComponent, lastContract.historyOfTransitContracts );
-        role = SharkDeliveryProtocolRole.TRANSFEROR;
-        this.deliveryContract = newContract;
-        sendAndEncryptMessage(deliveryContract, transferee);
-    }
-    public ASAPChannel getChannel(CharSequence uri) throws IOException {
-        try {
-            ASAPStorage asapStorage =
-                    this.asapPeer.getASAPStorage(SHARK_DELIVERY_PROTOCOL_FORMAT);
-
-            ASAPChannel channel = asapStorage.getChannel(uri);
-
-            return channel;
-        } catch (ASAPException e) {
-            throw new RuntimeException(e);
-        }
-
     }
     public void sendAndEncryptMessage(MessageContent messageNotEncrypted, CharSequence receiver) throws IOException, ASAPException {
         Set<CharSequence> recipient = new HashSet<>();
@@ -152,7 +156,7 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
                 message,
                 receiver,
                 sharkPKIComponent);
-        this.asapPeer.sendASAPMessage(SharkDeliveryProtocolComponent.SHARK_DELIVERY_PROTOCOL_FORMAT, SharkDeliveryProtocolComponent.SHARK_DELIVERY_URI_IDENTIFICATION_CODE, message);
+        this.asapPeer.sendASAPMessage(SharkHedwigComponent.SHARK_HEDWIG_FORMAT, SharkHedwigComponent.SHARK_HEDWIG_URI_IDENTIFICATION_CODE, message);
 
     }
     public Message decryptMessage(byte[] message) throws IOException, ASAPException {
@@ -198,4 +202,28 @@ public class SharkDeliveryProtocolComponentImpl implements SharkComponent, Shark
         }
     }
 
+    @Override
+    public void startSession(CharSequence transferee, CharSequence packageID) throws IOException, ASAPException {
+        deliveryContract = contractStorage.get(packageID);
+        this.transferee = transferee;
+        this.packageID = packageID;
+        if (deliveryContract == null){
+            return; // cannot start a session without the deliverycontract existing.
+        }
+        startIdentificationSession(transferee);
+
+    }
+
+    @Override
+    public void initiateAndSaveDeliveryContract(CharSequence e2eReceiver, CharSequence packageID, Location e2eReceiverLocation) throws ASAPException {
+        DeliveryMetadataImpl deliveraMetadata= DeliveryMetadataImpl.createDeliveraMetadata(myID, e2eReceiver, e2eReceiverLocation, packageID);
+        deliveraMetadata.sign(sharkPKIComponent);
+        DeliveryContractImpl newDeliveryContract = new DeliveryContractImpl(null, new ArrayList<>(), deliveraMetadata);
+        contractStorage.save(newDeliveryContract);
+    }
+
+    @Override
+    public ArrayList<DeliveryContract> getAllDeliveryContract() throws IOException, ClassNotFoundException {
+        return contractStorage.getAll();
+    }
 }

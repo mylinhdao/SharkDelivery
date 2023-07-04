@@ -46,4 +46,7 @@ public class Utils {
     public static LocalTime getLocaltime(){
         return LocalTime.now();
     }
+    public static boolean provePackageID(CharSequence packageID){
+        return true;
+    }
 }
